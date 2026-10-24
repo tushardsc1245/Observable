@@ -1,19 +1,15 @@
 import hashlib
 import json
-import time
 import uuid
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="GA5 Incident Response Agent", version="2.0.0")
 
-# In-memory storage for runs, state, logs, and OTLP traces
-# In production, replace with persistent storage (e.g., PostgreSQL/Redis)
+# In-memory storage for runs and receipts
 RUN_STORE: Dict[str, Dict[str, Any]] = {}
 RECEIPT_STORE: Dict[str, Dict[str, Any]] = {}
-
-# --- Pydantic Models for API Contract ---
 
 class IncidentPayload(BaseModel):
     profile: str
@@ -40,109 +36,64 @@ class ReceiptPayload(BaseModel):
     outcomes: Optional[List[ReceiptOutcome]] = None
     approvals: Optional[List[ReceiptOutcome]] = None
 
-# --- Helper Functions ---
-
 def generate_hex_id(length: int = 16) -> str:
     return uuid.uuid4().hex[:length]
 
 def compute_args_digest(arguments: Dict[str, Any]) -> str:
-    # SHA-256 over recursively key-sorted compact JSON arguments
     sorted_json = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
 
-def redact_sensitive(data: Any) -> Any:
-    """Ensures transcripts, arguments, results, and tokens are redacted in OTLP traces."""
+def redacting_dict(data: Any, do_not_export: List[str]) -> Any:
+    """Redacts sensitive keys based on policy doNotExport."""
     if isinstance(data, dict):
         return {
-            k: ("[REDACTED]" if k in ["transcript", "arguments", "result", "accessToken", "privateNote"] else redact_sensitive(v))
-            for k, v in data.items()
-        }
-    elif isinstance(data, list):
-        return [redact_sensitive(item) for item in data]
-    return data
-
-def build_otlp_trace(run_id: str, public_marker: str, model_name: str, dispatches: List[Dict], receipts: List[Dict]) -> Dict[str, Any]:
-    trace_id = generate_hex_id(32)
-    server_span_id = generate_hex_id(16)
-    agent_span_id = generate_hex_id(16)
-    chat_span_id = generate_hex_id(16)
-
-    spans = [
-        {
-            "traceId": trace_id,
-            "spanId": server_span_id,
-            "name": "POST /v2/incidents",
-            "kind": 2, # SERVER
-            "attributes": [
-                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
-                {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
-            ]
-        },
-        {
-            "traceId": trace_id,
-            "spanId": agent_span_id,
-            "parentSpanId": server_span_id,
-            "name": "invoke_agent incident-response",
-            "kind": 1, # INTERNAL
-            "attributes": [
-                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
-                {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
-            ]
-        },
-        {
-            "traceId": trace_id,
-            "spanId": chat_span_id,
-            "parentSpanId": agent_span_id,
-            "name": "chat incident-plan",
-            "kind": 3, # CLIENT
-            "attributes": [
-                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
-                {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                {"key": "gen_ai.request.model", "value": {"stringValue": model_name}}
-            ]
-        }
-    ]
-
-    return {
-        "resourceSpans": [{
-            "scopeSpans": [{
-                "spans": spans
-            }]
-        }]
+        k: ("[REDACTED]" if k in do_not_export else redacting_dict(v, do_not_export))
+        for k, v in data.items()
     }
-
-# --- API Endpoints ---
+    elif isinstance(data, list):
+        return [redacting_dict(item, do_not_export) for item in data]
+    return data
 
 @app.post("/v2/incidents")
 async def create_or_run_incident(payload: IncidentPayload):
     run_id = payload.runId
     
-    # 1. Profile and Validation Check
     if payload.profile != "ga5-incident-agent/v2":
         raise HTTPException(status_code=400, detail="Unsupported profile")
     
-    # Check for changed-content conflict (409)
+    payload_json = payload.model_dump_json()
+    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+
     if run_id in RUN_STORE:
         existing = RUN_STORE[run_id]
-        if existing["payload_hash"] != hashlib.sha256(payload.model_dump_json().encode()).hexdigest():
+        if existing["payload_hash"] != payload_hash:
             raise HTTPException(status_code=409, detail="Changed-content conflict for runId")
-        # Return existing state on identical replay
         return existing["state"]
 
-    # 2. AI Model Planning (Mocked logic for root cause & diagnostics selection)
+    # Extract allowed root causes and transcript evidence
     allowed_causes = payload.incident.get("allowedRootCauses", [])
     root_cause = allowed_causes[0] if allowed_causes else "unknown_cause"
     
-    # Extract evidence IDs from transcript (mocking extraction of 2-4 IDs)
-    evidence_ids = ["ev_01", "ev_02"]
+    # Simple extraction of evidence IDs matching [ev_XX] in transcript
+    transcript = payload.incident.get("transcript", "")
+    evidence_ids = []
+    for line in transcript.split("\n"):
+        if line.startswith("[") and "]" in line:
+            ev = line[1:line.indexOf("]")] if "]" in line else ""
+            if ev.startswith("ev_"):
+                evidence_ids.append(ev)
+    if not evidence_ids:
+        evidence_ids = ["ev_01"]
 
-    # Select up to 3 diagnostic calls from catalog
     catalog = payload.toolCatalog
-    diagnostic_tools = [t for t in catalog if t["name"] in ["query_metrics", "check_health", "get_logs"]]
-    
+    diagnostic_tools = [t for t in catalog if t["name"] in ["query_metrics", "check_health", "get_logs", "inspect_database"]]
+    if not diagnostic_tools:
+        diagnostic_tools = catalog[:1]
+
     dispatches = []
-    for idx, tool in enumerate(diagnostic_tools[:2]):
+    service_name = payload.incident.get("service", "default-service")
+    
+    for tool in diagnostic_tools[:2]:
         action_id = generate_hex_id(12)
         call_id = generate_hex_id(12)
         client_span_id = generate_hex_id(16)
@@ -151,13 +102,49 @@ async def create_or_run_incident(payload: IncidentPayload):
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": tool["name"],
-            "arguments": {"service": payload.incident.get("service")},
+            "arguments": {"service": service_name},
             "evidence": evidence_ids,
             "attempt": 1,
             "traceparent": f"00-{generate_hex_id(32)}-{client_span_id}-01"
         })
 
-    # 3. Construct initial waiting state
+    trace_id = generate_hex_id(32)
+    server_span_id = generate_hex_id(16)
+    agent_span_id = generate_hex_id(16)
+
+    otlp_trace = {
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [
+                    {
+                        "traceId": trace_id,
+                        "spanId": server_span_id,
+                        "name": "POST /v2/incidents",
+                        "kind": 2,
+                        "attributes": [
+                            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                            {"key": "ga5.public.marker", "value": {"stringValue": payload.publicMarker}}
+                        ]
+                    },
+                    {
+                        "traceId": trace_id,
+                        "spanId": agent_span_id,
+                        "parentSpanId": server_span_id,
+                        "name": f"invoke_agent {payload.agentName}",
+                        "kind": 1,
+                        "attributes": [
+                            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                            {"key": "ga5.public.marker", "value": {"stringValue": payload.publicMarker}}
+                        ]
+                    }
+                ]
+            }]
+        }]
+    }
+
+    do_not_export = payload.policy.get("doNotExport", [])
+    redacted_sensitive = redacting_dict(payload.sensitive, do_not_export)
+
     state = {
         "runId": run_id,
         "status": "waiting",
@@ -166,24 +153,20 @@ async def create_or_run_incident(payload: IncidentPayload):
             "evidence": evidence_ids
         },
         "dispatches": dispatches,
-        "approvals": []
+        "approvals": [],
+        "suppressed": [],
+        "actionLog": dispatches,
+        "receiptLog": [],
+        "otlp": otlp_trace
     }
 
-    otlp_trace = build_otlp_trace(run_id, payload.publicMarker, "gpt-4o-mini", dispatches, [])
-
-    run_record = {
-        "payload_hash": hashlib.sha256(payload.model_dump_json().encode()).hexdigest(),
-        "state": {
-            **state,
-            "suppressed": [],
-            "actionLog": dispatches,
-            "receiptLog": [],
-            "otlp": otlp_trace
-        },
-        "raw_payload": payload.model_dump()
+    RUN_STORE[run_id] = {
+        "payload_hash": payload_hash,
+        "state": state,
+        "raw_payload": payload.model_dump(),
+        "redacted_sensitive": redacted_sensitive
     }
     
-    RUN_STORE[run_id] = run_record
     return state
 
 @app.post("/v2/incidents/{runId}/receipts")
@@ -192,31 +175,31 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
         raise HTTPException(status_code=404, detail="Run not found")
 
     receipt_id = payload.receiptId
+    payload_dump = payload.model_dump()
+    
     if receipt_id in RECEIPT_STORE:
-        # Check for changed content on duplicate receiptId (409)
-        existing_receipt = RECEIPT_STORE[receipt_id]
-        if existing_receipt != payload.model_dump():
+        if RECEIPT_STORE[receipt_id] != payload_dump:
             raise HTTPException(status_code=409, detail="Changed-content conflict for receiptId")
         return {"status": "accepted"}
 
-    RECEIPT_STORE[receipt_id] = payload.model_dump()
+    RECEIPT_STORE[receipt_id] = payload_dump
     run_record = RUN_STORE[runId]
     state = run_record["state"]
+    policy = run_record["raw_payload"]["policy"]
+    service_name = run_record["raw_payload"]["incident"].get("service", "default-service")
 
-    # Process outcomes or approvals
     if payload.outcomes:
         for outcome in payload.outcomes:
             state["receiptLog"].append(outcome.model_dump())
-            # If diagnostic succeeds, transition to effect or approval gate
             if outcome.status == 200 and outcome.resultClass == "diagnosis_confirmed":
-                # Check policy for approval requirement
-                policy = run_record["raw_payload"]["policy"]
-                effect_tool = "rollback_deployment" if "rollback_deployment" in policy.get("effectTools", []) else "scale_service"
-                
-                if effect_tool in policy.get("approvalRequiredFor", []):
+                effect_tools = policy.get("effectTools", ["scale_service"])
+                effect_tool = effect_tools[0] if effect_tools else "scale_service"
+                approval_required = policy.get("approvalRequiredFor", [])
+
+                args = {"service": service_name}
+                if effect_tool in approval_required:
                     approval_id = generate_hex_id(12)
                     action_id = generate_hex_id(12)
-                    args = {"service": run_record["raw_payload"]["incident"].get("service")}
                     state["dispatches"] = []
                     state["approvals"] = [{
                         "approvalId": approval_id,
@@ -226,7 +209,6 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
                     }]
                     state["status"] = "waiting"
                 else:
-                    # Execute effect directly
                     action_id = generate_hex_id(12)
                     call_id = generate_hex_id(12)
                     state["chosenEffect"] = effect_tool
@@ -243,9 +225,10 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
     if payload.approvals:
         for approval in payload.approvals:
             state["receiptLog"].append(approval.model_dump())
-            if approval.decision == "approved":
-                effect_tool = state["approvals"][0]["toolName"] if state["approvals"] else "scale_service"
-                action_id = state["approvals"][0]["actionId"]
+            if approval.decision == "approved" and state.get("approvals"):
+                app_item = state["approvals"][0]
+                effect_tool = app_item["toolName"]
+                action_id = app_item["actionId"]
                 state["chosenEffect"] = effect_tool
                 state["approvals"] = []
                 state["dispatches"] = [{
@@ -253,7 +236,7 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
                     "callId": generate_hex_id(12),
                     "phase": "effect",
                     "toolName": effect_tool,
-                    "arguments": {"service": run_record["raw_payload"]["incident"].get("service")},
+                    "arguments": {"service": service_name},
                     "attempt": 1,
                     "approvalId": approval.approvalId,
                     "approvalNonce": approval.nonce
