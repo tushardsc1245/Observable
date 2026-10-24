@@ -47,9 +47,9 @@ def redacting_dict(data: Any, do_not_export: List[str]) -> Any:
     """Redacts sensitive keys based on policy doNotExport."""
     if isinstance(data, dict):
         return {
-        k: ("[REDACTED]" if k in do_not_export else redacting_dict(v, do_not_export))
-        for k, v in data.items()
-    }
+            k: ("[REDACTED]" if k in do_not_export else redacting_dict(v, do_not_export))
+            for k, v in data.items()
+        }
     elif isinstance(data, list):
         return [redacting_dict(item, do_not_export) for item in data]
     return data
@@ -79,7 +79,8 @@ async def create_or_run_incident(payload: IncidentPayload):
     evidence_ids = []
     for line in transcript.split("\n"):
         if line.startswith("[") and "]" in line:
-            ev = line[1:line.indexOf("]")] if "]" in line else ""
+            idx = line.find("]")
+            ev = line[1:idx] if idx != -1 else ""
             if ev.startswith("ev_"):
                 evidence_ids.append(ev)
     if not evidence_ids:
