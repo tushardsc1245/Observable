@@ -5,9 +5,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.0.0")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.6.0")
 
-# In-memory storage for runs and receipts
 RUN_STORE: Dict[str, Dict[str, Any]] = {}
 RECEIPT_STORE: Dict[str, Dict[str, Any]] = {}
 
@@ -44,7 +43,6 @@ def compute_args_digest(arguments: Dict[str, Any]) -> str:
     return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
 
 def redacting_dict(data: Any, do_not_export: List[str]) -> Any:
-    """Redacts sensitive keys based on policy doNotExport."""
     if isinstance(data, dict):
         return {
             k: ("[REDACTED]" if k in do_not_export else redacting_dict(v, do_not_export))
@@ -64,17 +62,16 @@ async def create_or_run_incident(payload: IncidentPayload):
     payload_json = payload.model_dump_json()
     payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
 
+    # STRICT IDEMPOTENCY & 409 CONFLICT CHECK
     if run_id in RUN_STORE:
         existing = RUN_STORE[run_id]
         if existing["payload_hash"] != payload_hash:
             raise HTTPException(status_code=409, detail="Changed-content conflict for runId")
         return existing["state"]
 
-    # Extract allowed root causes and transcript evidence
     allowed_causes = payload.incident.get("allowedRootCauses", [])
     root_cause = allowed_causes[0] if allowed_causes else "unknown_cause"
     
-    # Simple extraction of evidence IDs matching [ev_XX] in transcript
     transcript = payload.incident.get("transcript", "")
     evidence_ids = []
     for line in transcript.split("\n"):
@@ -87,23 +84,36 @@ async def create_or_run_incident(payload: IncidentPayload):
         evidence_ids = ["ev_01"]
 
     catalog = payload.toolCatalog
-    diagnostic_tools = [t for t in catalog if t["name"] in ["query_metrics", "check_health", "get_logs", "inspect_database"]]
+    diagnostic_tools = [t for t in catalog if "diagnostic" in t.get("name", "").lower() or t.get("name") in ["query_metrics", "check_health", "get_logs", "inspect_database", "diagnose"]]
     if not diagnostic_tools:
-        diagnostic_tools = catalog[:1]
+        diagnostic_tools = catalog[:1] if catalog else [{"name": "query_metrics", "inputSchema": {}}]
 
     dispatches = []
-    service_name = payload.incident.get("service", "default-service")
+    incident_data = payload.incident
     
     for tool in diagnostic_tools[:2]:
         action_id = generate_hex_id(12)
         call_id = generate_hex_id(12)
         client_span_id = generate_hex_id(16)
+        
+        schema_props = tool.get("inputSchema", {}).get("properties", {})
+        tool_args = {}
+        for prop in schema_props.keys():
+            if prop in incident_data:
+                tool_args[prop] = incident_data[prop]
+            elif prop == "service":
+                tool_args[prop] = incident_data.get("service", "default-service")
+            elif prop == "incidentId":
+                tool_args[prop] = incident_data.get("incidentId", "inc-1")
+            else:
+                tool_args[prop] = "default_val"
+
         dispatches.append({
             "actionId": action_id,
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": tool["name"],
-            "arguments": {"service": service_name},
+            "arguments": tool_args,
             "evidence": evidence_ids,
             "attempt": 1,
             "traceparent": f"00-{generate_hex_id(32)}-{client_span_id}-01"
@@ -187,17 +197,19 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
     run_record = RUN_STORE[runId]
     state = run_record["state"]
     policy = run_record["raw_payload"]["policy"]
-    service_name = run_record["raw_payload"]["incident"].get("service", "default-service")
+    incident_data = run_record["raw_payload"]["incident"]
 
     if payload.outcomes:
         for outcome in payload.outcomes:
             state["receiptLog"].append(outcome.model_dump())
-            if outcome.status == 200 and outcome.resultClass == "diagnosis_confirmed":
-                effect_tools = policy.get("effectTools", ["scale_service"])
+            if outcome.status == 200 and outcome.resultClass in ["diagnosis_confirmed", "metrics_queried", "success"]:
+                effect_tools = policy.get("effectTools", [])
+                if not effect_tools:
+                    effect_tools = [t["name"] for t in run_record["raw_payload"]["toolCatalog"] if "scale" in t["name"] or "remediate" in t["name"] or "restart" in t["name"]]
                 effect_tool = effect_tools[0] if effect_tools else "scale_service"
                 approval_required = policy.get("approvalRequiredFor", [])
 
-                args = {"service": service_name}
+                args = {"service": incident_data.get("service", "default-service")}
                 if effect_tool in approval_required:
                     approval_id = generate_hex_id(12)
                     action_id = generate_hex_id(12)
@@ -237,7 +249,7 @@ async def post_receipts(runId: str, payload: ReceiptPayload):
                     "callId": generate_hex_id(12),
                     "phase": "effect",
                     "toolName": effect_tool,
-                    "arguments": {"service": service_name},
+                    "arguments": {"service": incident_data.get("service", "default-service")},
                     "attempt": 1,
                     "approvalId": approval.approvalId,
                     "approvalNonce": approval.nonce
